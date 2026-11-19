@@ -5,6 +5,7 @@
 - FishFood: Viên cám cá, tép khô, mảnh cám, HOẶC Ký tự / Từ khóa / Emoji rơi từ đỉnh màn hình xuống.
 - PongBubble: Quả bóng bong bóng cho trò chơi "Bóng bàn Bong Bóng" (Bubble Pong) tâng qua lại với cá.
 - SplashRippleOverlay: Hiệu ứng gợn sóng nước tung tóe khi cá lặn tòm ẩn mình (Boss Key) hoặc ngoi lên.
+- FallingCageOverlay: Hiệu ứng chiếc lồng sắt bị bẻ cong vỡ/rơi xuống đáy màn hình và mờ dần biến mất.
 """
 from __future__ import annotations
 
@@ -32,6 +33,25 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
+from fish_renderer import draw_iron_cage_for_overlay
+from fish_sensors import apply_macos_all_spaces
+
+_MACOS_ALL_SPACES_ENABLED = True
+
+
+def set_widgets_all_spaces(enabled: bool) -> None:
+    """Bật/tắt chế độ đi theo qua mọi Desktop (Spaces) cho toàn bộ widget vệ tinh mới tạo."""
+    global _MACOS_ALL_SPACES_ENABLED
+    _MACOS_ALL_SPACES_ENABLED = bool(enabled)
+
+
+class _AllSpacesWidget(QWidget):
+    """QWidget cơ sở tự động áp dụng macOS CanJoinAllSpaces + FullScreenAuxiliary khi hiển thị."""
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        apply_macos_all_spaces(self, _MACOS_ALL_SPACES_ENABLED)
+
 URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 
 WORD_FOOD_COLORS = [
@@ -48,7 +68,7 @@ DEFAULT_WORD_TOKENS = [
 ]
 
 
-class ClipboardBubble(QWidget):
+class ClipboardBubble(_AllSpacesWidget):
     """Bong bóng xà phòng nổi mang biểu tượng nội dung vừa Ctrl+C."""
 
     BUBBLE_SIZE = 58
@@ -257,7 +277,7 @@ def paste_or_open_clipboard_payload(kind: str, payload: str | QImage) -> None:
         )
 
 
-class PongBubble(QWidget):
+class PongBubble(_AllSpacesWidget):
     """Quả bóng bong bóng cho trò chơi Bóng bàn Bong Bóng (Bubble Pong)."""
 
     BUBBLE_SIZE = 62
@@ -437,7 +457,7 @@ class PongBubble(QWidget):
         p.restore()
 
 
-class SplashRippleOverlay(QWidget):
+class SplashRippleOverlay(_AllSpacesWidget):
     """Hiệu ứng gợn sóng nước tung tóe ở mép dưới khi cá lặn ẩn mình (Boss Key) / ngoi lên."""
 
     def __init__(self):
@@ -456,12 +476,14 @@ class SplashRippleOverlay(QWidget):
         self.resize(260, 120)
 
         self._progress = 1.0
+        self._mode = "boss"  # "boss" | "takeoff"
         self._drops: list[list[float]] = []
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.hide()
 
     def trigger_at(self, center_x: float, bottom_y: float):
+        self._mode = "boss"
         self.move(int(center_x - self.width() / 2), int(bottom_y - self.height() + 10))
         self._progress = 0.0
         self._drops = [
@@ -475,12 +497,28 @@ class SplashRippleOverlay(QWidget):
             self._timer.start(16)
         self.update()
 
+    def trigger_takeoff_at(self, center_x: float, surface_y: float):
+        """Vòng tròn gợn sóng nhỏ tại điểm cất cánh trên thanh tiêu đề, tan biến sau ~0.5s."""
+        self._mode = "takeoff"
+        self.move(int(center_x - self.width() / 2), int(surface_y - self.height() + 18))
+        self._progress = 0.0
+        self._drops = [
+            [self.width() / 2.0 + random.uniform(-14, 14), self.height() - 18.0,
+             random.uniform(-2.6, 2.6), random.uniform(-4.8, -2.0), random.uniform(2.6, 4.8)]
+            for _ in range(5)
+        ]
+        self.show()
+        self.raise_()
+        if not self._timer.isActive():
+            self._timer.start(16)
+        self.update()
+
     def _tick(self):
-        self._progress += 0.032
+        self._progress += 0.032  # ~31 frames * 16ms ≈ 0.50s
         for d in self._drops:
             d[0] += d[2]
             d[1] += d[3]
-            d[3] += 0.34
+            d[3] += 0.30 if self._mode == "takeoff" else 0.34
         if self._progress >= 1.0:
             self._timer.stop()
             self.hide()
@@ -497,16 +535,19 @@ class SplashRippleOverlay(QWidget):
         cx = self.width() / 2.0
         cy = self.height() - 18.0
 
-        # 3 vòng gợn sóng đồng tâm lan rộng
+        # Vòng gợn sóng đồng tâm lan rộng (nhỏ gọn khi cất cánh từ thanh tiêu đề)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        for i in range(3):
-            rp = max(0.0, min(1.0, prog * 1.25 - i * 0.16))
+        is_takeoff = self._mode == "takeoff"
+        ring_count = 2 if is_takeoff else 3
+        for i in range(ring_count):
+            rp = max(0.0, min(1.0, prog * 1.25 - i * 0.18))
             if rp <= 0.0:
                 continue
-            a = int(220 * (1.0 - rp) * alpha)
-            rx = 18.0 + rp * 98.0
-            ry = 6.0 + rp * 18.0
-            p.setPen(QPen(QColor(115, 225, 255, max(0, a)), 3.2 - rp * 1.6))
+            a = int((230 if is_takeoff else 220) * (1.0 - rp) * alpha)
+            rx = (10.0 + rp * 50.0) if is_takeoff else (18.0 + rp * 98.0)
+            ry = (3.5 + rp * 9.5) if is_takeoff else (6.0 + rp * 18.0)
+            col = QColor(195, 245, 255, max(0, a)) if is_takeoff else QColor(115, 225, 255, max(0, a))
+            p.setPen(QPen(col, (2.4 if is_takeoff else 3.2) - rp * 1.4))
             p.drawEllipse(QPointF(cx, cy), rx, ry)
 
         # Các giọt nước bắn tung lên
@@ -517,7 +558,7 @@ class SplashRippleOverlay(QWidget):
                 p.drawEllipse(QPointF(x, y), r * (1.0 - prog * 0.4), r * (1.0 - prog * 0.4))
 
 
-class WaterOverlay(QWidget):
+class WaterOverlay(_AllSpacesWidget):
     """Lớp nước trong suốt dâng lên/rút xuống cho Pomodoro Tập Trung (xuyên chuột)."""
 
     def __init__(self):
@@ -684,7 +725,7 @@ class WaterOverlay(QWidget):
         p.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
 
 
-class FishFood(QWidget):
+class FishFood(_AllSpacesWidget):
     """Hạt cám cá, tép khô, mảnh cám hoặc Ký tự / Từ khóa / Emoji rơi chậm xuống đáy."""
 
     PELLET_KINDS = ("pellet", "shrimp", "flake")
@@ -790,3 +831,139 @@ class FishFood(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 240, 210, 170))
             p.drawEllipse(QRectF(-4, -5, 4, 4))
+
+
+class FallingCageOverlay(_AllSpacesWidget):
+    """Hiệu ứng chiếc lồng sắt đã bị bẻ cong rơi tự do xuống đáy màn hình và mờ dần biến mất."""
+
+    OVERLAY_SIZE = 224
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
+        self.resize(self.OVERLAY_SIZE, self.OVERLAY_SIZE)
+
+        self._active = False
+        self._cx = 0.0
+        self._cy = 0.0
+        self._vx = 0.0
+        self._vy = 0.0
+        self._rot = 0.0
+        self._rot_vel = 0.0
+        self._bend = 1.0
+        self._opacity = 0.0
+        self._bottom_y = 1080.0
+        self._shards: list[list[float]] = []  # [lx, ly, vx, vy, rot, rot_v, length]
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def trigger_at(
+        self,
+        center_x: float,
+        center_y: float,
+        swing_deg: float,
+        bend_amount: float,
+        bottom_y: float,
+    ):
+        self._active = True
+        self._cx = float(center_x)
+        self._cy = float(center_y)
+        self._vx = random.uniform(-1.1, 1.1)
+        self._vy = -1.8
+        self._rot = float(swing_deg)
+        self._rot_vel = random.choice([-1.0, 1.0]) * random.uniform(2.2, 3.8)
+        self._bend = max(0.0, min(1.0, bend_amount))
+        self._opacity = 1.0
+        self._bottom_y = float(bottom_y)
+        half = self.OVERLAY_SIZE / 2.0
+        self._shards = [
+            [
+                half + random.uniform(-28, 28),
+                half + random.uniform(-18, 24),
+                random.uniform(-3.4, 3.4),
+                random.uniform(-5.0, -1.2),
+                random.uniform(0, 360),
+                random.uniform(-14.0, 14.0),
+                random.uniform(7.0, 14.0),
+            ]
+            for _ in range(8)
+        ]
+        self.move(int(self._cx - half), int(self._cy - half))
+        self.show()
+        self.raise_()
+        if not self._timer.isActive():
+            self._timer.start(16)
+        self.update()
+
+    def stop(self):
+        self._active = False
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        if not self._active:
+            self._timer.stop()
+            self.hide()
+            return
+
+        self._vy += 0.58
+        self._cx += self._vx
+        self._cy += self._vy
+        self._rot += self._rot_vel
+
+        # Mờ dần theo thời gian rơi & tăng tốc fade-out khi chạm gần đáy màn hình
+        fade = 0.017
+        dist_to_bottom = self._bottom_y - self._cy
+        if dist_to_bottom < 160.0:
+            fade += 0.032
+        self._opacity = max(0.0, self._opacity - fade)
+
+        for s in self._shards:
+            s[0] += s[2]
+            s[1] += s[3]
+            s[3] += 0.25
+            s[4] += s[5]
+
+        half = self.OVERLAY_SIZE / 2.0
+        if self._opacity <= 0.01 or (self._cy - half) > self._bottom_y:
+            self._active = False
+            self._timer.stop()
+            self.hide()
+            return
+
+        self.move(int(self._cx - half), int(self._cy - half))
+        self.update()
+
+    def paintEvent(self, _):
+        if not self._active or self._opacity <= 0.01:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        half = self.OVERLAY_SIZE / 2.0
+        scale = 0.88 + 0.12 * self._opacity
+        draw_iron_cage_for_overlay(p, half, half, self._rot, self._bend, self._opacity, scale=scale)
+
+        # Vài mảnh sắt / tia vỡ bay tách khỏi khung lồng
+        p.save()
+        p.setOpacity(self._opacity)
+        for lx, ly, _, _, rot, _, length in self._shards:
+            p.save()
+            p.translate(lx, ly)
+            p.rotate(rot)
+            p.setPen(QPen(QColor("#22262c"), 4.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(-length * 0.5, 0.0), QPointF(length * 0.5, 0.0))
+            p.setPen(QPen(QColor("#85929e"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(-length * 0.5, 0.0), QPointF(length * 0.5, 0.0))
+            p.restore()
+        p.restore()

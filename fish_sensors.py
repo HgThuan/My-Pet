@@ -6,13 +6,15 @@ Bao gồm:
 - AudioSpectrumMonitor: bắt biên độ & bass drop từ âm thanh hệ thống + chế độ Demo.
 - WindowTracker: lấy tọa độ các cửa sổ ứng dụng đang mở (X11 libX11.so.6 / Windows)
   để cá lướt hoặc đậu ngó lên thanh tiêu đề cửa sổ (Window Perching / Surfing).
-- GlobalHotkeyListener: bắt phím tắt toàn cục Ctrl+Shift+H (Boss Key / Lặn sâu ẩn mình)
-  qua X11 XGrabKey mà không cần cài thêm thư viện ngoài.
-- SoundPlayer: tổng hợp âm thanh "bụp" (pop) và "tõm" (splash) bằng code.
+- GlobalHotkeyListener: bắt phím tắt toàn cục Ctrl+Shift+H (Boss Key) và Ctrl+Esc (Lồng giam)
+  trên Linux X11, macOS (Carbon) và Windows mà không cần cài thêm thư viện ngoài.
+- SoundPlayer: tổng hợp âm thanh "bụp" (pop), "tõm" (splash), khóa lồng "cạch" (cage_lock)
+  và kim loại uốn cong (metal_bend) bằng code.
 """
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import math
 import os
 import select
@@ -24,6 +26,7 @@ import tempfile
 import threading
 import time
 import wave
+from dataclasses import dataclass
 from datetime import datetime
 
 from PySide6.QtCore import QObject, QPoint, QRect, QUrl, Signal
@@ -145,22 +148,46 @@ def _load_x11():
         return None
 
 
+@dataclass
+class TrackedWindow:
+    wid: int
+    rect: QRect
+
+
 class WindowTracker:
-    """Lấy danh sách hình chữ nhật của các cửa sổ ứng dụng đang mở (trình duyệt, IDE, terminal...)."""
+    """Lấy danh sách cửa sổ ứng dụng đang mở kèm ID để theo dõi di chuyển / đóng / thu nhỏ trực tiếp."""
 
     def __init__(self):
         self._x11 = _load_x11()
+        self._mac_cg = self._load_macos_cg() if sys.platform == "darwin" else None
         self._my_pid = os.getpid()
+        self.tracked_windows: list[TrackedWindow] = []
         self.windows: list[QRect] = []
 
-    def sample(self) -> list[QRect]:
+    def sample_tracked(self) -> list[TrackedWindow]:
         if self._x11 is not None:
-            self.windows = self._sample_x11()
+            self.tracked_windows = self._sample_x11()
+        elif self._mac_cg is not None:
+            self.tracked_windows = self._sample_macos()
         elif sys.platform == "win32":
-            self.windows = self._sample_windows()
+            self.tracked_windows = self._sample_windows()
         else:
-            self.windows = []
+            self.tracked_windows = []
+        self.windows = [tw.rect for tw in self.tracked_windows]
+        return self.tracked_windows
+
+    def sample(self) -> list[QRect]:
+        self.sample_tracked()
         return self.windows
+
+    def get_window_rect(self, wid: int) -> QRect | None:
+        """Truy vấn nhanh tọa độ hiện tại của một cửa sổ theo ID (trả về None nếu đã đóng/thu nhỏ)."""
+        if not wid:
+            return None
+        for tw in self.sample_tracked():
+            if tw.wid == wid:
+                return tw.rect
+        return None
 
     def _get_ulongs_prop(self, dpy, win: int, atom: int) -> list[int]:
         actual_type = ctypes.c_ulong()
@@ -181,8 +208,8 @@ class WindowTracker:
             self._x11.XFree(prop)
         return res
 
-    def _sample_x11(self) -> list[QRect]:
-        rects: list[QRect] = []
+    def _sample_x11(self) -> list[TrackedWindow]:
+        rects: list[TrackedWindow] = []
         dpy = None
         try:
             self._x11.XSetErrorHandler(_SILENT_X_ERR_HANDLER)
@@ -241,7 +268,7 @@ class WindowTracker:
                 # Bỏ qua cửa sổ full-screen sát đỉnh (không còn chỗ phía trên để ngó đầu)
                 # vẫn giữ nếu đỉnh >= top + 40 để cá đậu lên thanh tiêu đề
                 if y >= sgeo.top() + 36 and y <= sgeo.bottom() - 120:
-                    rects.append(QRect(x, y, w, h))
+                    rects.append(TrackedWindow(wid=int(wid), rect=QRect(x, y, w, h)))
         except Exception:
             pass
         finally:
@@ -252,8 +279,8 @@ class WindowTracker:
                     pass
         return rects
 
-    def _sample_windows(self) -> list[QRect]:
-        rects: list[QRect] = []
+    def _sample_windows(self) -> list[TrackedWindow]:
+        rects: list[TrackedWindow] = []
         try:
             user32 = ctypes.windll.user32
 
@@ -274,7 +301,7 @@ class WindowTracker:
                     w = rc.right - rc.left
                     h = rc.bottom - rc.top
                     if w >= 240 and h >= 150 and rc.top >= 40:
-                        rects.append(QRect(rc.left, rc.top, w, h))
+                        rects.append(TrackedWindow(wid=int(hwnd), rect=QRect(rc.left, rc.top, w, h)))
                 return True
 
             user32.EnumWindows(enum_proc(cb), 0)
@@ -282,20 +309,178 @@ class WindowTracker:
             pass
         return rects
 
+    @staticmethod
+    def _load_macos_cg() -> dict[str, object] | None:
+        """Tải CoreGraphics + CoreFoundation qua ctypes để lấy danh sách cửa sổ ứng dụng trên macOS."""
+        try:
+            cg_path = ctypes.util.find_library("CoreGraphics")
+            cf_path = ctypes.util.find_library("CoreFoundation")
+            if not cg_path or not cf_path:
+                return None
+            cg = ctypes.CDLL(cg_path)
+            cf = ctypes.CDLL(cf_path)
+
+            class _CGPoint(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+            class _CGSize(ctypes.Structure):
+                _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+            class _CGRect(ctypes.Structure):
+                _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
+            cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+            cg.CGRectMakeWithDictionaryRepresentation.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CGRect)]
+            cg.CGRectMakeWithDictionaryRepresentation.restype = ctypes.c_bool
+
+            cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+            cf.CFArrayGetCount.restype = ctypes.c_long
+            cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+            cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+            cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+            cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p]
+            cf.CFNumberGetValue.restype = ctypes.c_bool
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+            return {
+                "cg": cg,
+                "cf": cf,
+                "CGRect": _CGRect,
+                "k_layer": ctypes.c_void_p.in_dll(cg, "kCGWindowLayer"),
+                "k_pid": ctypes.c_void_p.in_dll(cg, "kCGWindowOwnerPID"),
+                "k_bounds": ctypes.c_void_p.in_dll(cg, "kCGWindowBounds"),
+                "k_alpha": ctypes.c_void_p.in_dll(cg, "kCGWindowAlpha"),
+                "k_number": ctypes.c_void_p.in_dll(cg, "kCGWindowNumber"),
+            }
+        except Exception:
+            return None
+
+    def _sample_macos(self) -> list[TrackedWindow]:
+        """Lấy tọa độ và ID các cửa sổ ứng dụng đang hiển thị trên macOS (ưu tiên từ trên xuống dưới)."""
+        rects: list[TrackedWindow] = []
+        rt = self._mac_cg
+        if not rt:
+            return rects
+        cg = rt["cg"]
+        cf = rt["cf"]
+        CGRect = rt["CGRect"]
+        arr = None
+        try:
+            # kCGWindowListOptionOnScreenOnly (1<<0) | kCGWindowListExcludeDesktopElements (1<<4)
+            arr = cg.CGWindowListCopyWindowInfo((1 << 0) | (1 << 4), 0)  # type: ignore[attr-defined]
+            if not arr:
+                return rects
+
+            screen = QGuiApplication.primaryScreen()
+            sgeo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+            count = int(cf.CFArrayGetCount(arr))  # type: ignore[attr-defined]
+
+            kCFNumberSInt64Type = 4
+            kCFNumberFloat64Type = 6
+            layer = ctypes.c_int64()
+            pid = ctypes.c_int64()
+            wnum = ctypes.c_int64()
+            alpha = ctypes.c_double()
+            rc = CGRect()  # type: ignore[operator]
+
+            for i in range(count):
+                d = cf.CFArrayGetValueAtIndex(arr, i)  # type: ignore[attr-defined]
+                if not d:
+                    continue
+                layer_ref = cf.CFDictionaryGetValue(d, rt["k_layer"])  # type: ignore[attr-defined]
+                pid_ref = cf.CFDictionaryGetValue(d, rt["k_pid"])  # type: ignore[attr-defined]
+                bounds_ref = cf.CFDictionaryGetValue(d, rt["k_bounds"])  # type: ignore[attr-defined]
+                if not (layer_ref and pid_ref and bounds_ref):
+                    continue
+
+                if not cf.CFNumberGetValue(layer_ref, kCFNumberSInt64Type, ctypes.byref(layer)):  # type: ignore[attr-defined]
+                    continue
+                if layer.value != 0:  # Chỉ lấy cửa sổ ứng dụng thông thường (bỏ menu bar, dock, overlay)
+                    continue
+
+                if not cf.CFNumberGetValue(pid_ref, kCFNumberSInt64Type, ctypes.byref(pid)):  # type: ignore[attr-defined]
+                    continue
+                if pid.value == self._my_pid:
+                    continue
+
+                alpha_ref = cf.CFDictionaryGetValue(d, rt["k_alpha"])  # type: ignore[attr-defined]
+                if alpha_ref and cf.CFNumberGetValue(alpha_ref, kCFNumberFloat64Type, ctypes.byref(alpha)):  # type: ignore[attr-defined]
+                    if alpha.value < 0.15:
+                        continue
+
+                if not cg.CGRectMakeWithDictionaryRepresentation(bounds_ref, ctypes.byref(rc)):  # type: ignore[attr-defined]
+                    continue
+
+                x = int(rc.origin.x)
+                y = int(rc.origin.y)
+                w = int(rc.size.width)
+                h = int(rc.size.height)
+                if w < 220 or h < 140:
+                    continue
+                if y >= sgeo.top() - 10 and y <= sgeo.bottom() - 100:
+                    wnum.value = 0
+                    num_ref = cf.CFDictionaryGetValue(d, rt["k_number"])  # type: ignore[attr-defined]
+                    if num_ref:
+                        cf.CFNumberGetValue(num_ref, kCFNumberSInt64Type, ctypes.byref(wnum))  # type: ignore[attr-defined]
+                    rects.append(TrackedWindow(wid=int(wnum.value), rect=QRect(x, y, w, h)))
+        except Exception:
+            pass
+        finally:
+            if arr:
+                try:
+                    cf.CFRelease(arr)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        return rects
+
 
 class GlobalHotkeyListener(QObject):
-    """Lắng nghe phím tắt toàn cục Ctrl + Shift + H (Boss Key) trên X11 bằng ctypes."""
+    """Lắng nghe phím tắt toàn cục Ctrl+Shift+H (Boss Key) và Ctrl+Esc (Lồng giam).
 
-    triggered = Signal()
+    Hỗ trợ Linux (X11 XGrabKey), macOS (Carbon RegisterEventHotKey) và Windows
+    (RegisterHotKey + WH_KEYBOARD_LL dự phòng cho Ctrl+Esc) không cần cài thêm thư viện ngoài.
+    """
+
+    triggered = Signal()       # Ctrl + Shift + H (Boss Key)
+    cage_triggered = Signal()  # Ctrl + Esc (Chế độ Lồng giam)
 
     def __init__(self):
         super().__init__()
         self._x11 = _load_x11()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._win_thread_id: int | None = None
+
+        # Tài nguyên Carbon trên macOS (giữ tham chiếu tránh GC)
+        self._carbon = None
+        self._mac_handler_cb = None
+        self._mac_handler_ref = None
+        self._mac_hotkey_refs: list[ctypes.c_void_p] = []
+        self._last_fire_boss = 0.0
+        self._last_fire_cage = 0.0
+
         if self._x11 is not None:
             self._thread = threading.Thread(target=self._run_x11_loop, daemon=True)
             self._thread.start()
+        elif sys.platform == "darwin":
+            self._setup_macos_hotkeys()
+        elif sys.platform == "win32":
+            self._thread = threading.Thread(target=self._run_windows_loop, daemon=True)
+            self._thread.start()
+
+    def _emit_boss(self):
+        now = time.monotonic()
+        if now - self._last_fire_boss > 0.35:
+            self._last_fire_boss = now
+            self.triggered.emit()
+
+    def _emit_cage(self):
+        now = time.monotonic()
+        if now - self._last_fire_cage > 0.35:
+            self._last_fire_cage = now
+            self.cage_triggered.emit()
 
     def _run_x11_loop(self):
         dpy = None
@@ -305,20 +490,26 @@ class GlobalHotkeyListener(QObject):
             if not dpy:
                 return
             root = self._x11.XDefaultRootWindow(dpy)
-            # Keysym 'h' = 0x0068, ControlMask = 1<<2 (4), ShiftMask = 1<<0 (1)
-            keycode = self._x11.XKeysymToKeycode(dpy, 0x0068)
-            if not keycode:
+            # Boss Key: 'h' (0x0068) + Ctrl|Shift (4|1)
+            # Cage Key: Escape (0xFF1B) + Ctrl (4)
+            kc_boss = self._x11.XKeysymToKeycode(dpy, 0x0068)
+            kc_cage = self._x11.XKeysymToKeycode(dpy, 0xFF1B)
+            if not kc_boss and not kc_cage:
                 return
-            base_mod = 4 | 1  # Ctrl + Shift
+
+            boss_mod = 4 | 1  # ControlMask | ShiftMask
+            cage_mod = 4      # ControlMask
             # Grab cả các biến thể CapsLock (2) và NumLock (16)
             for extra in (0, 2, 16, 18):
-                self._x11.XGrabKey(dpy, int(keycode), base_mod | extra, root, 0, 1, 1)
+                if kc_boss:
+                    self._x11.XGrabKey(dpy, int(kc_boss), boss_mod | extra, root, 0, 1, 1)
+                if kc_cage:
+                    self._x11.XGrabKey(dpy, int(kc_cage), cage_mod | extra, root, 0, 1, 1)
             self._x11.XSelectInput(dpy, root, 1)  # KeyPressMask = 1
             self._x11.XSync(dpy, 0)
 
             fd = self._x11.XConnectionNumber(dpy)
             ev = _XEvent()
-            last_fire = 0.0
 
             while not self._stop_event.is_set():
                 rlist, _, _ = select.select([fd], [], [], 0.25)
@@ -326,14 +517,19 @@ class GlobalHotkeyListener(QObject):
                     continue
                 while self._x11.XPending(dpy) > 0:
                     self._x11.XNextEvent(dpy, ctypes.byref(ev))
-                    if ev.type == 2 and ev.xkey.keycode == keycode:  # KeyPress = 2
-                        now = time.monotonic()
-                        if now - last_fire > 0.35:
-                            last_fire = now
-                            self.triggered.emit()
+                    if ev.type == 2:  # KeyPress = 2
+                        kc = ev.xkey.keycode
+                        mods = ev.xkey.state & (4 | 1 | 8)  # Ctrl, Shift, Alt
+                        if kc_boss and kc == kc_boss and (mods & 5) == 5:
+                            self._emit_boss()
+                        elif kc_cage and kc == kc_cage and mods == 4:
+                            self._emit_cage()
 
             for extra in (0, 2, 16, 18):
-                self._x11.XUngrabKey(dpy, int(keycode), base_mod | extra, root)
+                if kc_boss:
+                    self._x11.XUngrabKey(dpy, int(kc_boss), boss_mod | extra, root)
+                if kc_cage:
+                    self._x11.XUngrabKey(dpy, int(kc_cage), cage_mod | extra, root)
         except Exception:
             pass
         finally:
@@ -343,8 +539,212 @@ class GlobalHotkeyListener(QObject):
                 except Exception:
                     pass
 
+    def _setup_macos_hotkeys(self):
+        """Đăng ký global hotkey trên macOS bằng Carbon RegisterEventHotKey (không cần quyền Accessibility)."""
+        try:
+            lib_path = ctypes.util.find_library("Carbon")
+            if not lib_path:
+                return
+            carbon = ctypes.CDLL(lib_path)
+
+            class EventTypeSpec(ctypes.Structure):
+                _fields_ = [
+                    ("eventClass", ctypes.c_uint32),
+                    ("eventKind", ctypes.c_uint32),
+                ]
+
+            class EventHotKeyID(ctypes.Structure):
+                _fields_ = [
+                    ("signature", ctypes.c_uint32),
+                    ("id", ctypes.c_uint32),
+                ]
+
+            handler_cb_type = ctypes.CFUNCTYPE(
+                ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+            )
+
+            carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
+            carbon.InstallEventHandler.argtypes = [
+                ctypes.c_void_p,
+                handler_cb_type,
+                ctypes.c_ulong,
+                ctypes.POINTER(EventTypeSpec),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            carbon.InstallEventHandler.restype = ctypes.c_int32
+            carbon.RemoveEventHandler.argtypes = [ctypes.c_void_p]
+            carbon.RemoveEventHandler.restype = ctypes.c_int32
+            carbon.RegisterEventHotKey.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                EventHotKeyID,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            carbon.RegisterEventHotKey.restype = ctypes.c_int32
+            carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
+            carbon.UnregisterEventHotKey.restype = ctypes.c_int32
+            carbon.GetEventParameter.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            carbon.GetEventParameter.restype = ctypes.c_int32
+
+            k_event_class_keyboard = int.from_bytes(b"keyb", "big")
+            k_event_hotkey_pressed = 5
+            k_param_direct_object = int.from_bytes(b"----", "big")
+            type_hotkey_id = int.from_bytes(b"hkid", "big")
+            sig = int.from_bytes(b"GFSH", "big")
+
+            def _on_carbon_event(_next_handler, event_ref, _user_data):
+                hk_id = EventHotKeyID()
+                err = carbon.GetEventParameter(
+                    event_ref,
+                    k_param_direct_object,
+                    type_hotkey_id,
+                    None,
+                    ctypes.sizeof(hk_id),
+                    None,
+                    ctypes.byref(hk_id),
+                )
+                if err == 0 and hk_id.signature == sig:
+                    if hk_id.id == 1:
+                        self._emit_boss()
+                    elif hk_id.id == 2:
+                        self._emit_cage()
+                return 0
+
+            self._carbon = carbon
+            self._mac_handler_cb = handler_cb_type(_on_carbon_event)
+            target = carbon.GetApplicationEventTarget()
+            spec = EventTypeSpec(k_event_class_keyboard, k_event_hotkey_pressed)
+            handler_ref = ctypes.c_void_p()
+            if carbon.InstallEventHandler(
+                target, self._mac_handler_cb, 1, ctypes.byref(spec), None, ctypes.byref(handler_ref)
+            ) == 0:
+                self._mac_handler_ref = handler_ref
+                # id=1: Ctrl + Shift + H (kVK_ANSI_H = 0x04, controlKey|shiftKey = 0x1200)
+                # id=2: Ctrl + Esc (kVK_Escape = 0x35, controlKey = 0x1000)
+                for hk_num, vk_code, mods in ((1, 0x04, 0x1200), (2, 0x35, 0x1000)):
+                    ref = ctypes.c_void_p()
+                    status = carbon.RegisterEventHotKey(
+                        vk_code, mods, EventHotKeyID(sig, hk_num), target, 0, ctypes.byref(ref)
+                    )
+                    if status == 0 and ref.value:
+                        self._mac_hotkey_refs.append(ref)
+        except Exception:
+            pass
+
+    def _run_windows_loop(self):
+        """Đăng ký global hotkey trên Windows (RegisterHotKey + hook dự phòng cho Ctrl+Esc)."""
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            self._win_thread_id = int(kernel32.GetCurrentThreadId())
+
+            MOD_CONTROL = 0x0002
+            MOD_SHIFT = 0x0004
+            MOD_NOREPEAT = 0x4000
+            VK_H = 0x48
+            VK_ESCAPE = 0x1B
+            VK_CONTROL = 0x11
+            VK_SHIFT = 0x10
+            VK_MENU = 0x12
+            WM_HOTKEY = 0x0312
+            WM_KEYDOWN = 0x0100
+            WM_SYSKEYDOWN = 0x0104
+            WH_KEYBOARD_LL = 13
+
+            reg_boss = bool(user32.RegisterHotKey(None, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_H))
+            reg_cage = bool(user32.RegisterHotKey(None, 2, MOD_CONTROL | MOD_NOREPEAT, VK_ESCAPE))
+
+            hook_handle = None
+            hook_proc_ref = None
+            if not reg_cage:
+                # Windows thường giữ Ctrl+Esc cho Start Menu nên dùng hook mức thấp dự phòng
+                class KBDLLHOOKSTRUCT(ctypes.Structure):
+                    _fields_ = [
+                        ("vkCode", ctypes.c_uint32),
+                        ("scanCode", ctypes.c_uint32),
+                        ("flags", ctypes.c_uint32),
+                        ("time", ctypes.c_uint32),
+                        ("dwExtraInfo", ctypes.c_void_p),
+                    ]
+
+                hook_type = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)
+
+                def _ll_cb(n_code, w_param, l_param):
+                    if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        kb = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        if kb.vkCode == VK_ESCAPE:
+                            ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+                            shift_down = bool(user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+                            alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+                            if ctrl_down and not shift_down and not alt_down:
+                                self._emit_cage()
+                    return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
+
+                hook_proc_ref = hook_type(_ll_cb)
+                hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, hook_proc_ref, None, 0)
+
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+            class MSG(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", ctypes.c_void_p),
+                    ("message", ctypes.c_uint),
+                    ("wParam", ctypes.c_ulong),
+                    ("lParam", ctypes.c_long),
+                    ("time", ctypes.c_uint),
+                    ("pt", POINT),
+                ]
+
+            msg = MSG()
+            while not self._stop_event.is_set():
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret <= 0:
+                    break
+                if msg.message == WM_HOTKEY:
+                    if msg.wParam == 1:
+                        self._emit_boss()
+                    elif msg.wParam == 2:
+                        self._emit_cage()
+
+            if hook_handle:
+                user32.UnhookWindowsHookEx(hook_handle)
+            if reg_boss:
+                user32.UnregisterHotKey(None, 1)
+            if reg_cage:
+                user32.UnregisterHotKey(None, 2)
+            _ = hook_proc_ref
+        except Exception:
+            pass
+
     def stop(self):
         self._stop_event.set()
+        if self._carbon is not None:
+            try:
+                for ref in self._mac_hotkey_refs:
+                    self._carbon.UnregisterEventHotKey(ref)
+                self._mac_hotkey_refs.clear()
+                if self._mac_handler_ref is not None:
+                    self._carbon.RemoveEventHandler(self._mac_handler_ref)
+                    self._mac_handler_ref = None
+            except Exception:
+                pass
+        if sys.platform == "win32" and self._win_thread_id is not None:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(self._win_thread_id, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
 
 
 class SystemPressureMonitor:
@@ -665,13 +1065,15 @@ class AudioSpectrumMonitor:
 
 
 class SoundPlayer:
-    """Tổng hợp sẵn âm thanh 'bụp' (pop) và 'tõm' (splash) bằng WAV không cần file ngoài."""
+    """Tổng hợp sẵn âm thanh 'bụp' (pop), 'tõm' (splash), khóa lồng 'cạch' và uốn cong kim loại."""
 
     def __init__(self):
         self._paths: dict[str, str] = {}
         self._effects: dict[str, object] = {}
         self._build_pop()
         self._build_splash()
+        self._build_cage_lock()
+        self._build_metal_bend()
 
     def _write_wav(self, name: str, frames: bytes, sample_rate: int = 22050):
         try:
@@ -719,6 +1121,91 @@ class SoundPlayer:
             frames.extend(struct.pack("<h", val))
         self._write_wav("splash", bytes(frames), sr)
 
+    def _build_cage_lock(self):
+        """Tổng hợp tiếng lồng sắt rơi nhẹ + chốt khóa 'cạch' kim loại."""
+        sr = 22050
+        n = int(sr * 0.25)
+        frames = bytearray()
+        # LCG giả ngẫu nhiên nhẹ để tạo xung nhiễu kim loại ngắn (không cần random import)
+        seed = 1337
+        for i in range(n):
+            t = i / sr
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            noise = (seed / 0x3FFFFFFF) - 1.0
+
+            # Nhịp 1 (t = 0.00s): tiếng khung sắt chạm xuống ("keng" trầm nhẹ)
+            env1 = math.exp(-t * 28.0)
+            clang1 = (
+                0.50 * math.sin(2 * math.pi * 410.0 * t)
+                + 0.35 * math.sin(2 * math.pi * 1085.0 * t)
+                + 0.20 * math.sin(2 * math.pi * 1790.0 * t)
+            ) * env1
+
+            # Nhịp 2 (t = 0.065s): tiếng chốt khóa "cạch!" sắc gọn
+            t2 = t - 0.065
+            latch = 0.0
+            if t2 >= 0.0:
+                env2 = math.exp(-t2 * 45.0)
+                snap = math.exp(-t2 * 140.0) * noise * 0.55
+                ring = (
+                    0.48 * math.sin(2 * math.pi * 1420.0 * t2)
+                    + 0.34 * math.sin(2 * math.pi * 2380.0 * t2)
+                    + 0.22 * math.sin(2 * math.pi * 3410.0 * t2)
+                ) * env2
+                latch = ring + snap
+
+            w = (clang1 * 0.55 + latch * 0.78) * 0.68
+            val = int(max(-1.0, min(1.0, w)) * 32767)
+            frames.extend(struct.pack("<h", val))
+        self._write_wav("cage_lock", bytes(frames), sr)
+
+    def _build_metal_bend(self):
+        """Tổng hợp âm thanh kim loại rên rỉ uốn cong và bật tách thanh sắt."""
+        sr = 22050
+        n = int(sr * 0.58)
+        frames = bytearray()
+        phase1 = 0.0
+        phase2 = 0.0
+        phase3 = 0.0
+        seed = 4242
+        for i in range(n):
+            t = i / sr
+            p = i / n
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            noise = (seed / 0x3FFFFFFF) - 1.0
+
+            # Tiếng rít/uốn thanh sắt tăng dần ứng suất với rung FM kim loại
+            strain_wobble = math.sin(2 * math.pi * 19.0 * t) * (18.0 + 35.0 * p)
+            f1 = 195.0 + 360.0 * (p ** 1.35) + strain_wobble
+            f2 = f1 * 2.76  # họa âm phi điều hòa đặc trưng của kim loại
+            f3 = f1 * 4.43
+            phase1 += (2 * math.pi * f1) / sr
+            phase2 += (2 * math.pi * f2) / sr
+            phase3 += (2 * math.pi * f3) / sr
+
+            env_creak = math.sin(math.pi * min(1.0, p / 0.88)) * (0.45 + 0.55 * p)
+            creak = (
+                0.50 * math.sin(phase1)
+                + 0.32 * math.sin(phase2)
+                + 0.18 * math.sin(phase3)
+            ) * env_creak
+
+            # Cú bật/gãy thanh sắt ở cuối (p >= 0.76)
+            t_snap = t - 0.44
+            snap = 0.0
+            if t_snap >= 0.0:
+                s_env = math.exp(-t_snap * 24.0)
+                snap = (
+                    0.55 * math.sin(2 * math.pi * 880.0 * t_snap)
+                    + 0.40 * math.sin(2 * math.pi * 1640.0 * t_snap)
+                    + 0.30 * math.exp(-t_snap * 90.0) * noise
+                ) * s_env
+
+            w = (creak * 0.62 + snap * 0.72) * 0.65
+            val = int(max(-1.0, min(1.0, w)) * 32767)
+            frames.extend(struct.pack("<h", val))
+        self._write_wav("metal_bend", bytes(frames), sr)
+
     def _play(self, name: str):
         eff = self._effects.get(name)
         if eff is not None:
@@ -728,10 +1215,21 @@ class SoundPlayer:
             except Exception:
                 pass
         path = self._paths.get(name)
-        if path and sys.platform.startswith("linux") and shutil.which("aplay"):
+        if not path:
+            return
+        if sys.platform.startswith("linux") and shutil.which("aplay"):
             try:
                 subprocess.Popen(
                     ["aplay", "-q", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+        elif sys.platform == "darwin" and shutil.which("afplay"):
+            try:
+                subprocess.Popen(
+                    ["afplay", path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -743,6 +1241,12 @@ class SoundPlayer:
 
     def play_splash(self):
         self._play("splash")
+
+    def play_cage_lock(self):
+        self._play("cage_lock")
+
+    def play_metal_bend(self):
+        self._play("metal_bend")
 
     def cleanup(self):
         for path in self._paths.values():
@@ -759,3 +1263,159 @@ def is_late_night() -> bool:
     now = datetime.now()
     mins = now.hour * 60 + now.minute
     return mins >= 23 * 60 + 30 or mins < 4 * 60 + 30
+
+
+# ---------- Hỗ trợ macOS Multi-Desktop (Spaces) & Full-Screen ----------
+
+_MACOS_OBJC_CACHE: dict[str, object] | None = None
+_MACOS_OBJC_FAILED = False
+
+_NS_CAN_JOIN_ALL_SPACES = 1 << 0
+_NS_MOVE_TO_ACTIVE_SPACE = 1 << 1
+_NS_STATIONARY = 1 << 4
+_NS_FULLSCREEN_AUXILIARY = 1 << 8
+_NS_ACTIVATION_POLICY_ACCESSORY = 1
+
+
+def _get_macos_objc() -> dict[str, object] | None:
+    """Tải và cache các chữ ký gọi Objective-C runtime an toàn cho cả Apple Silicon (arm64) & Intel."""
+    global _MACOS_OBJC_CACHE, _MACOS_OBJC_FAILED
+    if sys.platform != "darwin" or _MACOS_OBJC_FAILED:
+        return None
+    if _MACOS_OBJC_CACHE is not None:
+        return _MACOS_OBJC_CACHE
+    try:
+        lib_path = ctypes.util.find_library("objc")
+        if not lib_path:
+            _MACOS_OBJC_FAILED = True
+            return None
+        objc = ctypes.CDLL(lib_path)
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.objc_getClass.restype = ctypes.c_void_p
+
+        _MACOS_OBJC_CACHE = {
+            "objc": objc,
+            "msg_ptr": ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc)),
+            "msg_ulong": ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc)),
+            "msg_void_ulong": ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(("objc_msgSend", objc)),
+            "msg_void_bool": ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool)(("objc_msgSend", objc)),
+            "msg_bool_sel": ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(("objc_msgSend", objc)),
+            "msg_bool_long": ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long)(("objc_msgSend", objc)),
+            "sel_window": objc.sel_registerName(b"window"),
+            "sel_get_beh": objc.sel_registerName(b"collectionBehavior"),
+            "sel_set_beh": objc.sel_registerName(b"setCollectionBehavior:"),
+            "sel_set_hide_deact": objc.sel_registerName(b"setHidesOnDeactivate:"),
+            "sel_set_can_hide": objc.sel_registerName(b"setCanHide:"),
+            "sel_set_ign_mouse": objc.sel_registerName(b"setIgnoresMouseEvents:"),
+            "sel_responds": objc.sel_registerName(b"respondsToSelector:"),
+            "sel_shared_app": objc.sel_registerName(b"sharedApplication"),
+            "sel_set_policy": objc.sel_registerName(b"setActivationPolicy:"),
+        }
+        return _MACOS_OBJC_CACHE
+    except Exception:
+        _MACOS_OBJC_FAILED = True
+        return None
+
+
+def configure_macos_app_for_spaces() -> bool:
+    """Đặt NSApplication ở chế độ Accessory trên macOS để Pet nổi trên mọi Desktop & Full-Screen
+    mà không bị macOS kéo về Desktop cũ khi tương tác."""
+    rt = _get_macos_objc()
+    if rt is None:
+        return False
+    try:
+        objc = rt["objc"]  # type: ignore[assignment]
+        ns_app_cls = objc.objc_getClass(b"NSApplication")  # type: ignore[attr-defined]
+        if not ns_app_cls:
+            return False
+        ns_app = rt["msg_ptr"](ns_app_cls, rt["sel_shared_app"])  # type: ignore[operator]
+        if not ns_app:
+            return False
+        return bool(rt["msg_bool_long"](ns_app, rt["sel_set_policy"], _NS_ACTIVATION_POLICY_ACCESSORY))  # type: ignore[operator]
+    except Exception:
+        return False
+
+
+def apply_macos_all_spaces(widget, enabled: bool = True) -> bool:
+    """Cấu hình NSWindowCollectionBehavior cho một QWidget trên macOS để đi theo qua mọi Desktop (Spaces)
+    và hiển thị được cả trên ứng dụng Full-Screen."""
+    if QGuiApplication.platformName() != "cocoa":
+        return False
+    rt = _get_macos_objc()
+    if rt is None or widget is None:
+        return False
+    try:
+        wid = int(widget.winId())
+        if not wid:
+            return False
+        ns_view = ctypes.c_void_p(wid)
+        ns_win = rt["msg_ptr"](ns_view, rt["sel_window"])  # type: ignore[operator]
+        if not ns_win:
+            return False
+
+        cur_beh = int(rt["msg_ulong"](ns_win, rt["sel_get_beh"]))  # type: ignore[operator]
+        if enabled:
+            # Gỡ MoveToActiveSpace vì AppKit cấm dùng chung với CanJoinAllSpaces
+            new_beh = (
+                (cur_beh & ~_NS_MOVE_TO_ACTIVE_SPACE)
+                | _NS_CAN_JOIN_ALL_SPACES
+                | _NS_STATIONARY
+                | _NS_FULLSCREEN_AUXILIARY
+            )
+        else:
+            new_beh = (cur_beh & ~(_NS_CAN_JOIN_ALL_SPACES | _NS_STATIONARY)) | _NS_FULLSCREEN_AUXILIARY
+
+        rt["msg_void_ulong"](ns_win, rt["sel_set_beh"], new_beh)  # type: ignore[operator]
+
+        if rt["msg_bool_sel"](ns_win, rt["sel_responds"], rt["sel_set_hide_deact"]):  # type: ignore[operator]
+            rt["msg_void_bool"](ns_win, rt["sel_set_hide_deact"], False)  # type: ignore[operator]
+        if rt["msg_bool_sel"](ns_win, rt["sel_responds"], rt["sel_set_can_hide"]):  # type: ignore[operator]
+            rt["msg_void_bool"](ns_win, rt["sel_set_can_hide"], False)  # type: ignore[operator]
+        return True
+    except Exception:
+        return False
+
+
+def set_window_click_through(widget, enabled: bool) -> bool:
+    """Bật/tắt chế độ xuyên chuột động (không làm nhấp nháy cửa sổ) cho macOS và Windows.
+
+    Dùng khi cá đang bơi trên thanh tiêu đề để người dùng bấm tab / kéo cửa sổ xuyên qua vùng rìa
+    mà vẫn bấm trực tiếp vào thân cá được.
+    """
+    if widget is None:
+        return False
+    if sys.platform == "darwin":
+        if QGuiApplication.platformName() != "cocoa":
+            return False
+        rt = _get_macos_objc()
+        if rt is None:
+            return False
+        try:
+            wid = int(widget.winId())
+            if not wid:
+                return False
+            ns_win = rt["msg_ptr"](ctypes.c_void_p(wid), rt["sel_window"])  # type: ignore[operator]
+            if not ns_win:
+                return False
+            rt["msg_void_bool"](ns_win, rt["sel_set_ign_mouse"], bool(enabled))  # type: ignore[operator]
+            return True
+        except Exception:
+            return False
+    if sys.platform == "win32":
+        try:
+            hwnd = int(widget.winId())
+            if not hwnd:
+                return False
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new_ex = (ex | WS_EX_TRANSPARENT) if enabled else (ex & ~WS_EX_TRANSPARENT)
+            if new_ex != ex:
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex)
+            return True
+        except Exception:
+            return False
+    return False
