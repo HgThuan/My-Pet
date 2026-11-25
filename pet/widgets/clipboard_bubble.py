@@ -26,6 +26,7 @@ from pet.widgets.base import _AllSpacesWidget
 class ClipboardBubble(_AllSpacesWidget):
     """Bong bóng xà phòng nổi mang biểu tượng nội dung vừa Ctrl+C."""
 
+    _PASSIVE_CLICK_THROUGH = False
     BUBBLE_SIZE = 58
 
     def __init__(

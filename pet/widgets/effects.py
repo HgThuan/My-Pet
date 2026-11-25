@@ -23,6 +23,8 @@ from pet.widgets.base import _AllSpacesWidget
 class SplashRippleOverlay(_AllSpacesWidget):
     """Hiệu ứng gợn sóng nước tung tóe ở mép dưới khi cá lặn ẩn mình (Boss Key) / ngoi lên."""
 
+    _PASSIVE_CLICK_THROUGH = True
+
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
@@ -55,7 +57,7 @@ class SplashRippleOverlay(_AllSpacesWidget):
             for _ in range(12)
         ]
         self.show()
-        self.raise_()
+        self.raise_no_activate()
         if not self._timer.isActive():
             self._timer.start(16)
         self.update()
@@ -71,7 +73,7 @@ class SplashRippleOverlay(_AllSpacesWidget):
             for _ in range(5)
         ]
         self.show()
-        self.raise_()
+        self.raise_no_activate()
         if not self._timer.isActive():
             self._timer.start(16)
         self.update()
@@ -126,6 +128,7 @@ class SplashRippleOverlay(_AllSpacesWidget):
 class ParticleFieldOverlay(_AllSpacesWidget):
     """Lớp hạt xuyên chuột cỡ rộng (520x440) bám theo vùng quanh cá giúp bong bóng cầu vồng & hạt chóng mặt bay tự do không bị cắt khung vuông."""
 
+    _PASSIVE_CLICK_THROUGH = True
     OVERLAY_W = 520
     OVERLAY_H = 440
 
@@ -169,7 +172,7 @@ class ParticleFieldOverlay(_AllSpacesWidget):
             self._origin_y = int(gy - self.OVERLAY_H / 2.0)
             self.move(self._origin_x, self._origin_y)
             self.show()
-            self.raise_()
+            self.raise_no_activate()
         self._items.append([kind, gx, gy, vx, vy, float(life), float(life), float(size), color, random.uniform(0.0, math.tau)])
         if not self._timer.isActive():
             self._timer.start(16)
@@ -247,6 +250,8 @@ class ParticleFieldOverlay(_AllSpacesWidget):
 class ThoughtBubbleOverlay(_AllSpacesWidget):
     """Bong bóng suy nghĩ nhỏ xuyên chuột phía trên đầu cá (chữ đòi ăn / icon thùng rác / no căng)."""
 
+    _PASSIVE_CLICK_THROUGH = True
+
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
@@ -282,7 +287,7 @@ class ThoughtBubbleOverlay(_AllSpacesWidget):
         h = th + 30
         self.resize(w, h)
         self.show()
-        self.raise_()
+        self.raise_no_activate()
         self.update()
 
     def show_trash_icon(self, duration_ticks: int = 150):
@@ -293,7 +298,7 @@ class ThoughtBubbleOverlay(_AllSpacesWidget):
         self._alpha = 1.0
         self.resize(64, 58)
         self.show()
-        self.raise_()
+        self.raise_no_activate()
         self.update()
 
     def dismiss(self):

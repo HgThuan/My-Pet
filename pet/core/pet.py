@@ -53,10 +53,13 @@ from pet.platform import (
     GlobalHotkeyListener,
     WindowTracker,
     apply_macos_all_spaces,
+    bring_window_to_front_no_activate,
+    configure_overlay_window,
     extract_dropped_paths,
     has_droppable_data,
     move_path_to_trash,
     permanently_delete_path,
+    set_window_click_through,
 )
 from pet.rendering import render_fish
 from pet.sensors import (
@@ -89,10 +92,13 @@ class GoldenFishPet(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
         self.setAttribute(Qt.WidgetAttribute.WA_AcceptDrops, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self.resize(SIZE, SIZE)
@@ -291,10 +297,14 @@ class GoldenFishPet(QWidget):
         self.hotkey = GlobalHotkeyListener()
         self.hotkey.triggered.connect(self.toggle_boss_hide)
         self.hotkey.cage_triggered.connect(self.toggle_cage_mode)
-        self._local_boss_shortcut = QShortcut(QKeySequence("Ctrl+Shift+H"), self)
-        self._local_boss_shortcut.activated.connect(self.toggle_boss_hide)
-        self._local_cage_shortcut = QShortcut(QKeySequence("Ctrl+Esc"), self)
-        self._local_cage_shortcut.activated.connect(self.toggle_cage_mode)
+        # Chỉ đăng ký QShortcut cục bộ nếu phím tắt toàn cục OS không khả dụng (tránh Qt giữ focus phím)
+        self._local_boss_shortcut = None
+        self._local_cage_shortcut = None
+        if not self.hotkey.is_active:
+            self._local_boss_shortcut = QShortcut(QKeySequence("Ctrl+Shift+H"), self)
+            self._local_boss_shortcut.activated.connect(self.toggle_boss_hide)
+            self._local_cage_shortcut = QShortcut(QKeySequence("Ctrl+Esc"), self)
+            self._local_cage_shortcut.activated.connect(self.toggle_cage_mode)
         self.tray = create_tray_icon(self)
 
         self.move(int(self.px), int(self.py))
@@ -699,7 +709,7 @@ class GoldenFishPet(QWidget):
         self.cage_break_sound_played = False
         self.cage_break_released = False
         self.move(int(self.px), int(self.py))
-        self.raise_()
+        bring_window_to_front_no_activate(self)
         self.update()
 
     def start_cage_breakout(self) -> None:
@@ -761,7 +771,7 @@ class GoldenFishPet(QWidget):
             self.vy = -12.0
             self.vx = random.uniform(-1.5, 1.5)
             self.show()
-            self.raise_()
+            bring_window_to_front_no_activate(self)
             self.sound.play_splash()
             self.splash_overlay.trigger_at(self.px + SIZE / 2.0, bounds.bottom())
             for _ in range(8):
@@ -1227,13 +1237,13 @@ class GoldenFishPet(QWidget):
         # 5. Điều phối chuyển động theo trạng thái (State Dispatch Table)
         dispatch_movement(self, bounds, cur)
 
-        # 6. Ánh mắt 3 lớp, quay đầu & click-through thanh tiêu đề
+        # 6. Ánh mắt 3 lớp, quay đầu & Xuyên chuột thông minh 24/7
         self._update_cursor_eye_tracking(cur)
         if self._turn_ticks > 0:
             self._turn_ticks -= 1
         if self._surf_snap_cooldown > 0:
             self._surf_snap_cooldown -= 1
-        self.surfing.update_click_through(cur)
+        self._update_smart_click_through(cur)
 
         # 7. Banking, Squash-Stretch & nhịp vẫy đuôi
         spd_now = math.hypot(self.vx, self.vy)
@@ -1542,15 +1552,59 @@ class GoldenFishPet(QWidget):
         )
         render_fish(p, st)
 
-    # ---------- Tương tác chuột ----------
-    def _is_inside_fish_body(self, local_pos: QPoint) -> bool:
-        r = 58.0 + 28.0 * self.puff_factor
+    # ---------- Tương tác chuột & Xuyên chuột thông minh 24/7 (Smart Dynamic Click-Through) ----------
+    def _is_inside_fish_body(self, local_pos: QPoint, pad: float = 0.0) -> bool:
+        r = 58.0 + 28.0 * self.puff_factor + pad
         return math.hypot(local_pos.x() - SIZE / 2.0, local_pos.y() - SIZE / 2.0) <= r
 
-    def _is_inside_cage(self, local_pos: QPoint) -> bool:
+    def _is_inside_cage(self, local_pos: QPoint, pad: float = 0.0) -> bool:
         dx = abs(local_pos.x() - SIZE / 2.0)
         dy = local_pos.y() - (SIZE / 2.0 + 4.0)
-        return dx <= 64.0 and -86.0 <= dy <= 70.0
+        return dx <= (64.0 + pad) and (-86.0 - pad) <= dy <= (70.0 + pad)
+
+    def compute_want_click_through(self, cur: QPoint) -> bool:
+        """Tính xem cửa sổ Pet có nên xuyên chuột tại vị trí con trỏ hiện tại hay không.
+
+        - Luôn nhận chuột khi đang kéo cá / kéo lồng / đang thả file vào miệng.
+        - Luôn xuyên chuột trong các pha chuyển cảnh không tương tác (lặn sâu, phá lồng...).
+        - Trong mọi trạng thái khác (bơi tự do, ngủ, đói, lồng giam, lướt cửa sổ...):
+          chỉ nhận chuột đúng trên thân cá/lồng, còn ~70% vùng trong suốt xung quanh luôn xuyên thẳng
+          xuống ứng dụng làm việc bên dưới!
+        """
+        if (
+            self.state in ("drag", "swallow_ready", "swallow_gulp")
+            or self.cage_dragging
+            or self._press_global is not None
+        ):
+            return False
+
+        if self.state in ("dive_hide", "hidden", "surface_show", "breaking_out"):
+            return True
+
+        if self.state == "window_surf" and self._surf_phase in ("arc", "dip"):
+            fcx, fcy = self.center_global()
+            dist = math.hypot(cur.x() - fcx, cur.y() - fcy)
+            below_water = self._perch_rect is not None and cur.y() > (self._perch_rect.top() + 8)
+            r_surf = 50.0 if not self._click_through_active else 46.0
+            return (dist > r_surf) or below_water
+
+        local_pt = QPoint(int(round(cur.x() - self.px)), int(round(cur.y() - self.py)))
+        # Vùng đệm hysteresis 6px tránh bật/tắt liên tục ngay tại đường viền thân cá
+        pad = 6.0 if not self._click_through_active else 0.0
+        if self.state == "caged":
+            return not self._is_inside_cage(local_pt, pad=pad)
+        return not self._is_inside_fish_body(local_pt, pad=pad)
+
+    def _update_smart_click_through(self, cur: QPoint) -> None:
+        want_pass = self.compute_want_click_through(cur)
+        if want_pass != self._click_through_active:
+            if set_window_click_through(self, want_pass):
+                self._click_through_active = want_pass
+
+    def _clear_click_through(self) -> None:
+        if self._click_through_active:
+            set_window_click_through(self, False)
+            self._click_through_active = False
 
     def mousePressEvent(self, e) -> None:
         self._last_user_activity = time.monotonic()
@@ -1717,7 +1771,13 @@ class GoldenFishPet(QWidget):
 
     def showEvent(self, e) -> None:
         super().showEvent(e)
-        apply_macos_all_spaces(self, self.all_spaces_enabled)
+        configure_overlay_window(
+            self,
+            all_spaces=self.all_spaces_enabled,
+            click_through=None,
+        )
+        want_pass = self.compute_want_click_through(QCursor.pos())
+        self._click_through_active = want_pass if set_window_click_through(self, want_pass) else False
 
     def closeEvent(self, e) -> None:
         self.hunger_ctrl.save()
