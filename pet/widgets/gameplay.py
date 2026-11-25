@@ -25,6 +25,8 @@ from pet.widgets.base import _AllSpacesWidget
 class WaterOverlay(_AllSpacesWidget):
     """Lớp nước trong suốt dâng lên/rút xuống cho Pomodoro Tập Trung (xuyên chuột)."""
 
+    _PASSIVE_CLICK_THROUGH = True
+
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
@@ -192,6 +194,7 @@ class WaterOverlay(_AllSpacesWidget):
 class FishFood(_AllSpacesWidget):
     """Hạt cám cá, tép khô, mảnh cám hoặc Ký tự / Từ khóa / Emoji rơi chậm xuống đáy."""
 
+    _PASSIVE_CLICK_THROUGH = True
     PELLET_KINDS = ("pellet", "shrimp", "flake")
 
     def __init__(self, x: int, y: int, bottom_y: int, kind: str | None = None, word: str | None = None):
@@ -204,6 +207,7 @@ class FishFood(_AllSpacesWidget):
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
 
@@ -300,6 +304,7 @@ class FishFood(_AllSpacesWidget):
 class FallingCageOverlay(_AllSpacesWidget):
     """Hiệu ứng chiếc lồng sắt đã bị bẻ cong rơi tự do xuống đáy màn hình và mờ dần biến mất."""
 
+    _PASSIVE_CLICK_THROUGH = True
     OVERLAY_SIZE = 224
 
     def __init__(self):
@@ -365,7 +370,7 @@ class FallingCageOverlay(_AllSpacesWidget):
         ]
         self.move(int(self._cx - half), int(self._cy - half))
         self.show()
-        self.raise_()
+        self.raise_no_activate()
         if not self._timer.isActive():
             self._timer.start(16)
         self.update()

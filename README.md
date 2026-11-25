@@ -29,6 +29,9 @@ Linh vật desktop 2D vẽ bằng vector mượt mà ở **60 FPS** viết bằn
 - **Boss Key (`Ctrl + Shift + H`)**: Cá giật mình lặn tòm xuống đáy kèm gợn sóng, ẩn sạch màn hình để chia sẻ/họp; bấm lại để ngoi lên.
 - **Chế độ Lồng Giam (`Ctrl + Esc`)**: Giam cá vào lồng sắt 2D có thể kéo thả cố định ở bất kỳ đâu (góc màn hình, thanh tiêu đề cửa sổ) để tập trung làm việc; cá buồn bã liếc theo chuột và thỉnh thoảng bám thanh sắt van xin (`±3°`). Nhấn `Ctrl + Esc` lần 2 để cá hóa lực sĩ bẻ cong 2 thanh sắt giữa lồng kèm tia lửa, khói bụi và âm thanh kim loại, bật nhảy ra ngoài đầy tự hào.
 - **Hỗ trợ đa Desktop (Spaces) & Full-Screen trên macOS**: Tự động cấu hình `NSWindowCollectionBehavior` (`CanJoinAllSpaces | FullScreenAuxiliary`) để cá và mọi bong bóng/hiệu ứng đi theo bạn qua tất cả các Desktop và màn hình toàn màn hình (có thể bật/tắt trong menu chuột phải).
+- **Không cướp Focus bàn phím & Xuyên chuột thông minh 24/7 (macOS / Windows / Linux)**:
+  - Toàn bộ cửa sổ cá và overlay vệ tinh đều bật `WindowDoesNotAcceptFocus`, `WA_ShowWithoutActivating`, `NoFocus`, kết hợp cấu hình native không kích hoạt ứng dụng (`NSWindowStyleMaskNonactivatingPanel` + `orderFrontRegardless` trên macOS, `WS_EX_NOACTIVATE` + `SWP_NOACTIVATE` trên Windows, bỏ `raise_()` trên Linux) để tuyệt đối không làm gián đoạn gõ chữ/IME.
+  - Tự động bật xuyên chuột toàn thời gian trên ~70% vùng trong suốt xung quanh thân cá (`setIgnoresMouseEvents` trên macOS, `WS_EX_TRANSPARENT` trên Windows, X11 `ShapeInput` trên Linux), chỉ nhận chuột khi con trỏ đi vào đúng thân cá / lồng sắt hoặc đang kéo thả file, đồng thời khóa cứng xuyên chuột native cho toàn bộ 6 overlay thụ động.
 - **Phản ứng ngữ cảnh**: Nước sôi cảnh báo khi CPU/RAM > 85%, bọt trắng nảy Equalizer + backflip theo nhạc, nhận diện màu hình nền (ưa xanh dương / né đỏ cam) và đắp chăn rong biển sau 23:30.
 
 ## Kiến trúc mã nguồn

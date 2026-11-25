@@ -11,7 +11,6 @@ from PySide6.QtGui import QColor, QGuiApplication
 from pet.config import FPS, SIZE, HungerState
 from pet.core.math_utils import window_safe_zone
 from pet.models import Particle, TrackedWindow
-from pet.platform.os_window import set_window_click_through
 
 if TYPE_CHECKING:
     from pet.core.pet import GoldenFishPet
@@ -165,25 +164,11 @@ class WindowSurfController:
                 pet._set_direction(1 if pet.vx > 0 else -1)
 
     def update_click_through(self, cur: QPoint) -> None:
-        """Xuyên chuột vùng rìa khi cá nhảy trên thanh tiêu đề để không cản bấm tab/nút."""
-        pet = self.pet
-        active = pet.state == "window_surf" and pet._surf_phase in ("arc", "dip")
-        if not active:
-            self.clear_click_through()
-            return
-        fcx, fcy = pet.center_global()
-        dist = math.hypot(cur.x() - fcx, cur.y() - fcy)
-        below_water = pet._perch_rect is not None and cur.y() > (pet._perch_rect.top() + 8)
-        want_pass = (dist > 46.0) or below_water
-        if want_pass != pet._click_through_active:
-            if set_window_click_through(pet, want_pass):
-                pet._click_through_active = want_pass
+        """Ủy quyền cho cơ chế Xuyên chuột thông minh 24/7 trên GoldenFishPet."""
+        self.pet._update_smart_click_through(cur)
 
     def clear_click_through(self) -> None:
-        pet = self.pet
-        if pet._click_through_active:
-            set_window_click_through(pet, False)
-            pet._click_through_active = False
+        self.pet._clear_click_through()
 
     def trigger_perch(self, mode: str | None = None) -> bool:
         """Chủ động tìm cửa sổ đủ rộng & đủ khoảng trống trần để nhảy sóng hoặc thò đầu ngó."""

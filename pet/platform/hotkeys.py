@@ -37,13 +37,17 @@ class GlobalHotkeyListener(QObject):
         self._mac_hotkey_refs: list[ctypes.c_void_p] = []
         self._last_fire_boss = 0.0
         self._last_fire_cage = 0.0
+        self.is_active = False
 
         if self._x11 is not None:
+            self.is_active = True
             self._thread = threading.Thread(target=self._run_x11_loop, daemon=True)
             self._thread.start()
         elif sys.platform == "darwin":
             self._setup_macos_hotkeys()
+            self.is_active = bool(self._mac_hotkey_refs)
         elif sys.platform == "win32":
+            self.is_active = True
             self._thread = threading.Thread(target=self._run_windows_loop, daemon=True)
             self._thread.start()
 
